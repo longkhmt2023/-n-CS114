@@ -1,0 +1,151 @@
+import os
+import glob
+import csv
+from PIL import Image
+from pillow_heif import register_heif_opener
+register_heif_opener()
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+
+# ====== Dataset ======
+class MyDigitDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.transform = transform
+        self.image_paths = []
+        for ext in ('*.jpg', '*.jpeg', '*.png', '*.heic', '*.jfif'):
+            self.image_paths.extend(glob.glob(os.path.join(root_dir, ext)))
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        try:
+            image = Image.open(img_path).convert("RGB")
+            label = int(os.path.basename(img_path).split('_')[0])
+            if self.transform:
+                image = self.transform(image)
+            return image, label
+        except:
+            print(f"Lỗi ảnh: {img_path}")
+            return None
+
+class MyTestDataset(Dataset):
+    def __init__(self, folder, transform=None):
+        self.transform = transform
+        self.image_paths = []
+        for ext in ('*.jpg', '*.jpeg', '*.png', '*.heic', '*.jfif'):
+            self.image_paths.extend(glob.glob(os.path.join(folder, '**', ext), recursive=True))
+
+        valid_paths = []
+        for path in self.image_paths:
+            try:
+                Image.open(path).verify()
+                valid_paths.append(path)
+            except:
+                print(f"Ảnh lỗi (bỏ qua): {path}")
+        self.image_paths = valid_paths
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, img_path
+
+# ====== Transforms ======
+transformtrain = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+transformtest = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# ====== Paths ======
+root_path = r'D:\Train2'
+test_folder = r'D:\Test\data.2025'
+
+# ====== Load Data ======
+traindata = MyDigitDataset(root_path, transform=transformtrain)
+traindata = [item for item in traindata if item is not None]
+train_loader = DataLoader(traindata, batch_size=64, shuffle=True, num_workers=0)
+
+testdata = MyTestDataset(test_folder, transform=transformtest)
+test_loader = DataLoader(testdata, batch_size=64, shuffle=False, num_workers=0)
+
+print("Train samples:", len(traindata))
+print("Test samples:", len(testdata))
+
+# ====== Model ======
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = models.resnet18(pretrained=True)
+model.fc = nn.Linear(model.fc.in_features, 10)
+model = model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# ====== Evaluation ======
+def evaluate(model, dataloader):
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    return correct / total if total > 0 else 0
+
+# ====== Training ======
+num_epochs = 80
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+
+    avg_loss = running_loss / len(train_loader)
+    train_acc = evaluate(model, train_loader)
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Accuracy: {train_acc*100:.2f}%")
+
+# ====== Predict & Save ======
+model.eval()
+results = []
+with torch.no_grad():
+    for images, img_paths in test_loader:
+        images = images.to(device)
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+        preds = preds.cpu().numpy()
+        for path, pred in zip(img_paths, preds):
+            filename = os.path.basename(path)
+            results.append([filename, int(pred)])
+
+with open('WECODE_RESNET18.csv', 'w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(['filename', 'prediction'])
+    writer.writerows(results)

@@ -1,0 +1,147 @@
+import os
+import glob
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+import csv
+
+class MyDigitDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.transform = transform
+        image_paths = []
+        for ext in ('*.jpg', '*.jpeg', '*.png', '*.heic', '*.jfif'):
+            image_paths.extend(glob.glob(os.path.join(root_dir, ext)))
+        self.image_paths = image_paths
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        try:
+            basename = os.path.basename(img_path)
+            label_part = basename.split('_')[0]
+
+            # ✅ Kiểm tra nếu label không phải là số thì bỏ qua
+            if not label_part.isdigit():
+                raise ValueError(f"Nhãn không hợp lệ: {label_part}")
+
+            label = int(label_part)
+
+            image = Image.open(img_path).convert("RGB")
+            if self.transform:
+                image = self.transform(image)
+            return image, label
+        except Exception as e:
+            print(f"Lỗi đọc ảnh {img_path}: {e}")
+            return torch.zeros(3, 32, 32), -1
+
+class MyTestDataset(Dataset):
+    def __init__(self, image_dir, transform=None):
+        self.image_dir = image_dir
+        self.image_paths = [os.path.join(image_dir, fname)
+                            for fname in os.listdir(image_dir)
+                            if fname.endswith(('.png', '.jpg', '.jpeg', '*.heic', '*.jfif'))]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Lỗi đọc ảnh {img_path}: {e}")
+            return torch.zeros(3, 32, 32), os.path.basename(img_path)
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, os.path.basename(img_path)
+
+transform = transforms.Compose([
+    transforms.Resize((32, 32)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+
+train_dir = r'D:\Train2'
+test_dir = r'D:\Test\data.2025'
+
+train_dataset = MyDigitDataset(train_dir, transform=transform)
+print("Số lượng ảnh train:", len(train_dataset))
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+test_dataset = MyTestDataset(test_dir, transform=transform)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+class ANNModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.classifier = nn.Sequential(
+            nn.Linear(3 * 32 * 32, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 10)
+        )
+
+    def forward(self, x):
+        x = self.flatten(x)
+        x = self.classifier(x)
+        return x
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ANNModel().to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+num_epochs = 200
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    total = 0  # để đếm tổng số mẫu hợp lệ
+
+    for images, labels in train_loader:
+        # Bỏ qua ảnh có nhãn -1 (do lỗi đọc ảnh hoặc sai định dạng tên file)
+        mask = labels != -1
+        if mask.sum() == 0:
+            continue
+        images, labels = images[mask], labels[mask]
+
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        total += 1
+
+    avg_loss = running_loss / total if total > 0 else 0
+    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+
+model.eval()
+results = []
+with torch.no_grad():
+    for images, paths in test_loader:
+        images = images.to(device)
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+        preds = preds.cpu().numpy()
+        for path, pred in zip(paths, preds):
+            filename = os.path.basename(path)
+            results.append([filename, int(pred)])
+
+with open('ANN_predictions.csv', 'w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(['filename', 'prediction'])
+    writer.writerows(results)
